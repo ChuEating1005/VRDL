@@ -1,0 +1,47 @@
+# Data
+**/data/
+*.zip
+*.tar
+*.tar.gz
+
+# Model checkpoints
+**/checkpoints/
+*.pth
+*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.python-version
+
+# Virtual environment
+**/.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Opencode
+.sisyphus/
+.ruff_cache/
+
+# Weights & Biases
+**/wandb/
+
+# Misc
+*.log
+
+# HW1
+**/*.csv
