@@ -1,8 +1,8 @@
 # NYCU VRDL HW2: Digit Detection
 
 > [!NOTE]
-> Author: 朱驛庭 (Yi-Ting, Chu)
-> StudentID: 111550093
+> **Author**: 朱驛庭 (I-Ting, Chu)  
+> **StudentID**: 111550093
 
 ## Introduction
 
