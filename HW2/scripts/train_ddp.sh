@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /project3/chueating/VRDL/HW2
+torchrun --nproc_per_node=4 -m src.main --output_dir outputs/dino_r50_4scale "$@"
