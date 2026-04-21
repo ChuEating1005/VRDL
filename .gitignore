@@ -6,6 +6,7 @@
 
 # Model checkpoints
 **/checkpoints/
+**/outputs/
 *.pth
 *.pt
 
@@ -17,6 +18,7 @@ __pycache__/
 dist/
 build/
 *.egg
+*.so
 .python-version
 
 # Virtual environment
@@ -45,3 +47,19 @@ Thumbs.db
 
 # HW1
 **/*.csv
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.brf
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
