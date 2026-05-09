@@ -1,0 +1,34 @@
+[project]
+name = "vrdl-hw3"
+version = "0.1.0"
+description = "VRDL HW3 - Instance Segmentation on Colored Medical Images (Mask R-CNN)"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "numpy<2.0",
+    "Pillow",
+    "tqdm",
+    "matplotlib",
+    "opencv-python",
+    "scikit-image",
+    "tifffile",
+    "imagecodecs",
+    "pycocotools",
+    "albumentations",
+    "wandb",
+    "gdown",
+    "ipykernel",
+    "einops",
+    "tensorboard>=2.20.0",
+]
+
+[tool.uv]
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
