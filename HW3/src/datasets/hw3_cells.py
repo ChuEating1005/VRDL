@@ -52,6 +52,49 @@ def load_test_infos(data_root: str | Path) -> list[TestImageInfo]:
     ]
 
 
+def _class_presence_label(train_root: Path, sample_id: str) -> int:
+    label = 0
+    sample_dir = train_root / sample_id
+    for cls in range(1, 5):
+        mask_path = sample_dir / f"class{cls}.tif"
+        if mask_path.exists() and np.any(tifffile.imread(mask_path) != 0):
+            label |= 1 << (cls - 1)
+    return label
+
+
+def _random_split(sample_ids: list[str], val_ratio: float, seed: int) -> tuple[set[str], set[str]]:
+    rng = random.Random(seed)
+    shuffled = sample_ids[:]
+    rng.shuffle(shuffled)
+    n_val = max(1, int(round(len(shuffled) * val_ratio)))
+    val_ids = set(shuffled[:n_val])
+    train_ids = set(shuffled[n_val:])
+    return train_ids, val_ids
+
+
+def _stratified_fold_split(train_root: Path, sample_ids: list[str], fold: int, num_folds: int, seed: int) -> tuple[set[str], set[str]]:
+    if num_folds < 2:
+        raise ValueError(f"num_folds must be >= 2 when fold is set, got {num_folds}")
+    if fold < 0 or fold >= num_folds:
+        raise ValueError(f"fold must be in [0, {num_folds}), got {fold}")
+
+    groups: dict[int, list[str]] = {}
+    for sample_id in sample_ids:
+        groups.setdefault(_class_presence_label(train_root, sample_id), []).append(sample_id)
+
+    rng = random.Random(seed)
+    fold_ids = [set() for _ in range(num_folds)]
+    for label in sorted(groups):
+        group = groups[label]
+        rng.shuffle(group)
+        for idx, sample_id in enumerate(group):
+            fold_ids[idx % num_folds].add(sample_id)
+
+    val_ids = fold_ids[fold]
+    train_ids = set(sample_ids) - val_ids
+    return train_ids, val_ids
+
+
 class HW3CellsDataset(Dataset):
     """VRDL HW3 training dataset.
 
@@ -68,6 +111,8 @@ class HW3CellsDataset(Dataset):
         transforms: Any | None = None,
         copy_paste_prob: float = 0.0,
         copy_paste_classes: tuple[int, ...] = (3, 4),
+        fold: int = -1,
+        num_folds: int = 5,
     ) -> None:
         self.data_root = Path(data_root)
         self.train_root = self.data_root / "train"
@@ -75,13 +120,12 @@ class HW3CellsDataset(Dataset):
         self.copy_paste_prob = copy_paste_prob
         self.copy_paste_classes = set(copy_paste_classes)
         all_ids = sorted(p.name for p in self.train_root.iterdir() if p.is_dir())
-        rng = random.Random(seed)
-        shuffled = all_ids[:]
-        rng.shuffle(shuffled)
-        n_val = max(1, int(round(len(shuffled) * val_ratio)))
-        val_ids = set(shuffled[:n_val])
+        if fold >= 0:
+            train_ids, val_ids = _stratified_fold_split(self.train_root, all_ids, fold, num_folds, seed)
+        else:
+            train_ids, val_ids = _random_split(all_ids, val_ratio, seed)
         if split == "train":
-            self.sample_ids = [sid for sid in all_ids if sid not in val_ids]
+            self.sample_ids = [sid for sid in all_ids if sid in train_ids]
         elif split == "val":
             self.sample_ids = [sid for sid in all_ids if sid in val_ids]
         elif split == "all":
@@ -107,16 +151,12 @@ class HW3CellsDataset(Dataset):
             masks = np.asarray(transformed["masks"], dtype=np.uint8)
             if masks.size == 0:
                 masks = np.zeros((0, image.shape[0], image.shape[1]), dtype=np.uint8)
-            boxes = np.asarray(transformed["bboxes"], dtype=np.float32).reshape(-1, 4)
-            labels = np.asarray(transformed["labels"], dtype=np.int64)
+            labels = np.asarray(target["labels"].tolist()[: len(masks)], dtype=np.int64)
             target = self._build_target(
                 masks=masks,
                 labels=labels,
                 image_id=int(target["image_id"].item()),
             )
-            if len(boxes) == len(target["boxes"]):
-                target["boxes"] = torch.as_tensor(boxes, dtype=torch.float32)
-                target = self._filter_empty_target(target)
         return image_to_tensor(image), target
 
     def _load_raw(self, index: int) -> tuple[np.ndarray, dict[str, torch.Tensor]]:
@@ -155,6 +195,14 @@ class HW3CellsDataset(Dataset):
     ) -> dict[str, torch.Tensor]:
         masks_t = torch.as_tensor(masks, dtype=torch.uint8)
         labels_t = torch.as_tensor(labels, dtype=torch.int64)
+        if len(masks_t) != len(labels_t):
+            n = min(len(masks_t), len(labels_t))
+            masks_t = masks_t[:n]
+            labels_t = labels_t[:n]
+        if masks_t.numel() > 0:
+            keep = masks_t.flatten(1).bool().any(dim=1)
+            masks_t = masks_t[keep]
+            labels_t = labels_t[keep]
         if masks_t.numel() == 0:
             boxes = torch.zeros((0, 4), dtype=torch.float32)
         else:

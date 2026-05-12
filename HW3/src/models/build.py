@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Callable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torchvision.models import ConvNeXt_Tiny_Weights, ResNet101_Weights, ResNet50_Weights, convnext_tiny, resnet101, resnet50
+from torchvision.models import ConvNeXt_Tiny_Weights, ResNet101_Weights, ResNet50_Weights, convnext_tiny
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.anchor_utils import AnchorGenerator
@@ -17,6 +16,7 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from torchvision.models.detection.roi_heads import maskrcnn_loss as torchvision_maskrcnn_loss
 from torchvision.ops import FeaturePyramidNetwork
+from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
 
 
 class PAFPN(nn.Module):
@@ -118,7 +118,11 @@ def build_convnext_fpn(trainable_layers: int, use_pafpn: bool) -> nn.Module:
                     for param in model[module_idx].parameters():
                         param.requires_grad = False
     body = IntermediateLayerGetter(model, return_layers=return_layers)
-    fpn = FeaturePyramidNetwork(in_channels_list, out_channels=256)
+    fpn = FeaturePyramidNetwork(
+        in_channels_list,
+        out_channels=256,
+        extra_blocks=LastLevelMaxPool(),
+    )
 
     class ConvNeXtFPN(nn.Module):
         out_channels = 256
@@ -148,6 +152,13 @@ def build_model(
     detections_per_img: int = 1000,
     box_score_thresh: float = 0.05,
     mask_loss: str = "bce",
+    model_min_size: int = 512,
+    model_max_size: int = 1024,
+    rpn_pre_nms_top_n_train: int = 1000,
+    rpn_post_nms_top_n_train: int = 500,
+    rpn_pre_nms_top_n_test: int = 1000,
+    rpn_post_nms_top_n_test: int = 500,
+    box_batch_size_per_image: int = 256,
 ) -> MaskRCNN:
     """Build Mask R-CNN with CLI-controlled ablation switches."""
     patch_mask_loss(mask_loss)
@@ -169,6 +180,13 @@ def build_model(
         rpn_anchor_generator=anchor_generator,
         box_detections_per_img=detections_per_img,
         box_score_thresh=box_score_thresh,
+        min_size=model_min_size,
+        max_size=model_max_size,
+        rpn_pre_nms_top_n_train=rpn_pre_nms_top_n_train,
+        rpn_post_nms_top_n_train=rpn_post_nms_top_n_train,
+        rpn_pre_nms_top_n_test=rpn_pre_nms_top_n_test,
+        rpn_post_nms_top_n_test=rpn_post_nms_top_n_test,
+        box_batch_size_per_image=box_batch_size_per_image,
     )
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)

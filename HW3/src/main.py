@@ -31,7 +31,11 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.0025)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--optimizer", choices=["sgd", "adamw"], default="adamw")
+    parser.add_argument("--scheduler", choices=["multistep", "cosine"], default="cosine")
     parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--fold", type=int, default=-1, help="Validation fold index; -1 keeps the random val-ratio split")
+    parser.add_argument("--num-folds", type=int, default=5, help="Number of folds used when --fold >= 0")
     parser.add_argument("--clip-grad-norm", type=float, default=0.0)
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wandb-project", default="vrdl-hw3")
@@ -45,20 +49,32 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--small-anchors", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--detections-per-img", type=int, default=1000)
     parser.add_argument("--box-score-thresh", type=float, default=0.05)
+    parser.add_argument("--model-min-size", type=int, default=512, help="TorchVision transform short-side target")
+    parser.add_argument("--model-max-size", type=int, default=1024, help="TorchVision transform long-side cap")
+    parser.add_argument("--rpn-pre-nms-top-n-train", type=int, default=1000)
+    parser.add_argument("--rpn-post-nms-top-n-train", type=int, default=500)
+    parser.add_argument("--rpn-pre-nms-top-n-test", type=int, default=1000)
+    parser.add_argument("--rpn-post-nms-top-n-test", type=int, default=500)
+    parser.add_argument("--box-batch-size-per-image", type=int, default=256)
 
     # Data / competition tricks.
     parser.add_argument("--strong-aug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-scale", type=float, default=0.6)
     parser.add_argument("--max-scale", type=float, default=1.6)
-    parser.add_argument("--max-size", type=int, default=1333)
+    parser.add_argument("--max-size", type=int, default=1024, help="Final CPU augmentation longest-side cap")
+    parser.add_argument("--deformation-prob", type=float, default=0.0, help="Probability for Elastic/Grid/Optical distortion")
     parser.add_argument("--copy-paste-prob", type=float, default=0.0)
     parser.add_argument("--repeat-threshold", type=float, default=0.0, help=">0 enables rare-class weighted sampling")
 
     # Inference / submission.
     parser.add_argument("--mask-threshold", type=float, default=0.5)
     parser.add_argument("--score-threshold", type=float, default=0.05)
-    parser.add_argument("--tta-hflip", action="store_true")
+    parser.add_argument("--tta-hflip", action="store_true", help="Predict normal + horizontal flip")
+    parser.add_argument("--tta-vhflip", action="store_true", help="Predict normal + hflip + vflip + hvflip")
     parser.add_argument("--tta-scales", default="1.0", help="Comma-separated scales, e.g. 0.83,1.0,1.2")
+    parser.add_argument("--tta-fusion", choices=["none", "nms", "mask"], default="nms")
+    parser.add_argument("--tta-iou-threshold", type=float, default=0.5)
+    parser.add_argument("--tta-fusion-mask-threshold", type=float, default=0.5)
     parser.add_argument("--submission", default="outputs/test-results.json")
     parser.add_argument("--debug-samples", type=int, default=0, help="Use a tiny subset for smoke tests")
     return parser.parse_args()
@@ -98,6 +114,7 @@ def build_datasets(args: argparse.Namespace) -> tuple[HW3CellsDataset, HW3CellsD
         min_scale=args.min_scale,
         max_scale=args.max_scale,
         max_size=args.max_size,
+        deformation_prob=args.deformation_prob,
     )
     train_dataset = HW3CellsDataset(
         args.data_root,
@@ -106,8 +123,17 @@ def build_datasets(args: argparse.Namespace) -> tuple[HW3CellsDataset, HW3CellsD
         seed=args.seed,
         transforms=transforms,
         copy_paste_prob=args.copy_paste_prob,
+        fold=args.fold,
+        num_folds=args.num_folds,
     )
-    val_dataset = HW3CellsDataset(args.data_root, split="val", val_ratio=args.val_ratio, seed=args.seed)
+    val_dataset = HW3CellsDataset(
+        args.data_root,
+        split="val",
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        fold=args.fold,
+        num_folds=args.num_folds,
+    )
     if args.debug_samples > 0:
         train_dataset.sample_ids = train_dataset.sample_ids[: args.debug_samples]
         val_dataset.sample_ids = val_dataset.sample_ids[: max(1, args.debug_samples)]
@@ -123,6 +149,13 @@ def make_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Modul
         detections_per_img=args.detections_per_img,
         box_score_thresh=args.box_score_thresh,
         mask_loss=args.mask_loss,
+        model_min_size=args.model_min_size,
+        model_max_size=args.model_max_size,
+        rpn_pre_nms_top_n_train=args.rpn_pre_nms_top_n_train,
+        rpn_post_nms_top_n_train=args.rpn_post_nms_top_n_train,
+        rpn_pre_nms_top_n_test=args.rpn_pre_nms_top_n_test,
+        rpn_post_nms_top_n_test=args.rpn_post_nms_top_n_test,
+        box_batch_size_per_image=args.box_batch_size_per_image,
     )
     print(f"Trainable params: {count_trainable_parameters(model) / 1e6:.2f}M")
     return model.to(device)
@@ -133,6 +166,23 @@ def load_checkpoint_if_needed(model: torch.nn.Module, checkpoint: str, device: t
         return
     state = torch.load(checkpoint, map_location=device)
     model.load_state_dict(state.get("model", state))
+
+
+def build_optimizer(args: argparse.Namespace, model: torch.nn.Module) -> torch.optim.Optimizer:
+    params = [p for p in model.parameters() if p.requires_grad]
+    if args.optimizer == "sgd":
+        return torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+
+def build_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.LRScheduler:
+    if args.scheduler == "multistep":
+        return torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[max(1, args.epochs * 2 // 3)], gamma=0.1)
+    if args.scheduler == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    raise ValueError(f"Unsupported scheduler: {args.scheduler}")
 
 
 def init_wandb(args: argparse.Namespace, trainable_params: int) -> Any | None:
@@ -157,13 +207,8 @@ def run_train(args: argparse.Namespace) -> None:
     trainable_params = count_trainable_parameters(model)
     wandb_run = init_wandb(args, trainable_params)
     load_checkpoint_if_needed(model, args.checkpoint, device)
-    optimizer = torch.optim.SGD(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        momentum=0.9,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[max(1, args.epochs * 2 // 3)], gamma=0.1)
+    optimizer = build_optimizer(args, model)
+    scheduler = build_scheduler(args, optimizer)
     coco_gt = dataset_to_coco(val_dataset)
     best_ap50 = -1.0
     for epoch in range(args.epochs):
@@ -228,7 +273,11 @@ def run_infer(args: argparse.Namespace) -> None:
         mask_threshold=args.mask_threshold,
         score_threshold=args.score_threshold,
         tta_hflip=args.tta_hflip,
+        tta_vhflip=args.tta_vhflip,
         tta_scales=tuple(float(x) for x in args.tta_scales.split(",") if x),
+        tta_fusion=args.tta_fusion,
+        tta_iou_threshold=args.tta_iou_threshold,
+        tta_fusion_mask_threshold=args.tta_fusion_mask_threshold,
     )
     save_json(records, args.submission)
     print(f"Saved {len(records)} records to {args.submission}")

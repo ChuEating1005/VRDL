@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -12,7 +12,10 @@ from pycocotools.cocoeval import COCOeval
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.util.submit import prediction_to_records
+from pycocotools import mask as mask_util
+from torchvision.ops import box_iou, nms
+
+from src.util.submit import candidate_to_record, mask_to_rle, prediction_to_candidates, prediction_to_records
 
 
 def train_one_epoch(
@@ -29,8 +32,8 @@ def train_one_epoch(
     for images, targets in pbar:
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        loss_dict = model(images, targets)
-        losses = sum(loss for loss in loss_dict.values())
+        loss_dict = cast(dict[str, torch.Tensor], model(images, targets))
+        losses = torch.stack(list(loss_dict.values())).sum()
         if not math.isfinite(float(losses.item())):
             raise RuntimeError(f"Non-finite loss: {losses.item()} {loss_dict}")
         optimizer.zero_grad(set_to_none=True)
@@ -76,7 +79,16 @@ def evaluate_ap50(
     evaluator.evaluate()
     evaluator.accumulate()
     evaluator.summarize()
-    return {"ap": float(evaluator.stats[0]), "ap50": float(evaluator.stats[1])}
+    metrics: dict[str, float] = {"ap": float(evaluator.stats[0]), "ap50": float(evaluator.stats[1])}
+    precision = evaluator.eval["precision"]
+    cat_ids = evaluator.params.catIds
+    for k, cat_id in enumerate(cat_ids):
+        per_class = precision[0, :, k, 0, -1]
+        valid = per_class[per_class > -1]
+        ap50_c = float(valid.mean()) if valid.size else float("nan")
+        cat_name = coco_gt.cats[cat_id]["name"]
+        metrics[f"ap50_{cat_name}"] = ap50_c
+    return metrics
 
 
 @torch.inference_mode()
@@ -87,74 +99,219 @@ def predict_submission(
     mask_threshold: float = 0.5,
     score_threshold: float = 0.05,
     tta_hflip: bool = False,
+    tta_vhflip: bool = False,
     tta_scales: tuple[float, ...] = (1.0,),
+    tta_fusion: str = "none",
+    tta_iou_threshold: float = 0.5,
+    tta_fusion_mask_threshold: float = 0.5,
 ) -> list[dict[str, Any]]:
     model.eval()
     records: list[dict[str, Any]] = []
     for images, infos in tqdm(data_loader, desc="infer"):
-        images = [img.to(device) for img in images]
-        outputs = [_predict_with_tta(model, img, tta_hflip=tta_hflip, tta_scales=tta_scales) for img in images]
-        for output, info in zip(outputs, infos):
+        for image, info in zip(images, infos):
+            image = image.to(device)
             records.extend(
-                prediction_to_records(
-                    output,
-                    int(info.image_id),
+                _predict_records_with_tta(
+                    model=model,
+                    image=image,
+                    image_id=int(info.image_id),
                     mask_threshold=mask_threshold,
                     score_threshold=score_threshold,
+                    tta_hflip=tta_hflip,
+                    tta_vhflip=tta_vhflip,
+                    tta_scales=tta_scales,
+                    clear_cuda_cache=device.type == "cuda",
+                    tta_fusion=tta_fusion,
+                    tta_iou_threshold=tta_iou_threshold,
+                    tta_fusion_mask_threshold=tta_fusion_mask_threshold,
                 )
             )
+            del image
     return records
 
 
-def _merge_hflip_output(output: dict[str, torch.Tensor], flipped_output: dict[str, torch.Tensor], width: int) -> dict[str, torch.Tensor]:
-    boxes = flipped_output["boxes"].clone()
-    x1 = width - boxes[:, 2]
-    x2 = width - boxes[:, 0]
-    boxes[:, 0] = x1
-    boxes[:, 2] = x2
-    masks = torch.flip(flipped_output["masks"], dims=[3])
-    merged = {
-        "boxes": torch.cat([output["boxes"], boxes], dim=0),
-        "labels": torch.cat([output["labels"], flipped_output["labels"]], dim=0),
-        "scores": torch.cat([output["scores"], flipped_output["scores"]], dim=0),
-        "masks": torch.cat([output["masks"], masks], dim=0),
-    }
-    order = torch.argsort(merged["scores"], descending=True)
-    return {k: v[order] for k, v in merged.items()}
-
-
-def _predict_with_tta(
+def _predict_records_with_tta(
     model: torch.nn.Module,
     image: torch.Tensor,
+    image_id: int,
+    mask_threshold: float,
+    score_threshold: float,
     tta_hflip: bool,
+    tta_vhflip: bool,
     tta_scales: tuple[float, ...],
-) -> dict[str, torch.Tensor]:
+    clear_cuda_cache: bool,
+    tta_fusion: str,
+    tta_iou_threshold: float,
+    tta_fusion_mask_threshold: float,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    use_fusion = tta_fusion != "none" and (tta_hflip or tta_vhflip or len(tta_scales) > 1)
+    candidates = _predict_candidates_with_tta(
+        model=model,
+        image=image,
+        image_id=image_id,
+        mask_threshold=mask_threshold,
+        score_threshold=score_threshold,
+        tta_hflip=tta_hflip,
+        tta_vhflip=tta_vhflip,
+        tta_scales=tta_scales,
+        clear_cuda_cache=clear_cuda_cache,
+    )
+    if use_fusion:
+        return _fuse_tta_candidates(
+            candidates,
+            fusion=tta_fusion,
+            iou_threshold=tta_iou_threshold,
+            mask_threshold=tta_fusion_mask_threshold,
+        )
+    records.extend(candidate_to_record(candidate) for candidate in candidates)
+    return records
+
+
+def _predict_candidates_with_tta(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+    image_id: int,
+    mask_threshold: float,
+    score_threshold: float,
+    tta_hflip: bool,
+    tta_vhflip: bool,
+    tta_scales: tuple[float, ...],
+    clear_cuda_cache: bool,
+) -> list[dict[str, Any]]:
     base_h, base_w = image.shape[-2:]
-    merged_outputs: list[dict[str, torch.Tensor]] = []
+    candidates: list[dict[str, Any]] = []
+    flip_modes = _tta_flip_modes(tta_hflip=tta_hflip, tta_vhflip=tta_vhflip)
     for scale in tta_scales:
         if scale == 1.0:
             scaled = image
         else:
-            scaled = torch.nn.functional.interpolate(
-                image[None], scale_factor=scale, mode="bilinear", align_corners=False
-            )[0]
-        out = model([scaled])[0]
-        out = _resize_output_to_original(out, scaled.shape[-1], scaled.shape[-2], base_w, base_h)
-        merged_outputs.append(out)
-        if tta_hflip:
-            flipped = torch.flip(scaled, dims=[2])
-            flip_out = model([flipped])[0]
-            flip_out = _merge_hflip_output({k: v[:0] for k, v in out.items()}, flip_out, scaled.shape[-1])
-            flip_out = _resize_output_to_original(flip_out, scaled.shape[-1], scaled.shape[-2], base_w, base_h)
-            merged_outputs.append(flip_out)
-    if len(merged_outputs) == 1:
-        return merged_outputs[0]
-    concat = {
-        key: torch.cat([o[key] for o in merged_outputs], dim=0)
-        for key in ("boxes", "labels", "scores", "masks")
+            scaled = torch.nn.functional.interpolate(image[None], scale_factor=scale, mode="bilinear", align_corners=False)[0]
+        scaled_h, scaled_w = scaled.shape[-2:]
+        for hflip, vflip in flip_modes:
+            aug_image = _flip_image(scaled, hflip=hflip, vflip=vflip)
+            output = model([aug_image])[0]
+            output = _unflip_output(output, width=scaled_w, height=scaled_h, hflip=hflip, vflip=vflip)
+            output = _resize_output_to_original(output, scaled_w, scaled_h, base_w, base_h)
+            candidates.extend(
+                prediction_to_candidates(
+                    output,
+                    image_id,
+                    mask_threshold=mask_threshold,
+                    score_threshold=score_threshold,
+                )
+            )
+            del aug_image, output
+            if clear_cuda_cache:
+                torch.cuda.empty_cache()
+        if scale != 1.0:
+            del scaled
+            if clear_cuda_cache:
+                torch.cuda.empty_cache()
+    return candidates
+
+
+def _fuse_tta_candidates(
+    candidates: list[dict[str, Any]],
+    fusion: str,
+    iou_threshold: float,
+    mask_threshold: float,
+) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+    records: list[dict[str, Any]] = []
+    labels = sorted({int(c["category_id"]) for c in candidates})
+    for label in labels:
+        cls_candidates = [c for c in candidates if int(c["category_id"]) == label]
+        boxes = torch.tensor([c["box_xyxy"] for c in cls_candidates], dtype=torch.float32)
+        scores = torch.tensor([float(c["score"]) for c in cls_candidates], dtype=torch.float32)
+        keep = nms(boxes, scores, iou_threshold).tolist()
+        if fusion == "nms":
+            records.extend(candidate_to_record(cls_candidates[i]) for i in keep)
+            continue
+        assigned = torch.zeros((len(cls_candidates),), dtype=torch.bool)
+        ious = box_iou(boxes, boxes)
+        for keep_idx in keep:
+            if assigned[keep_idx]:
+                continue
+            group = torch.nonzero((ious[keep_idx] >= iou_threshold) & ~assigned, as_tuple=False).flatten().tolist()
+            for idx in group:
+                assigned[idx] = True
+            records.append(_fuse_candidate_group([cls_candidates[i] for i in group], mask_threshold=mask_threshold))
+    records.sort(key=lambda row: float(row["score"]), reverse=True)
+    return records
+
+
+def _fuse_candidate_group(candidates: list[dict[str, Any]], mask_threshold: float) -> dict[str, Any]:
+    if len(candidates) == 1:
+        return candidate_to_record(candidates[0])
+    scores = np.asarray([float(c["score"]) for c in candidates], dtype=np.float32)
+    weights = scores / max(float(scores.sum()), 1e-6)
+    fused: np.ndarray | None = None
+    for candidate, weight in zip(candidates, weights):
+        decoded = mask_util.decode(candidate["segmentation"]).astype(np.float32)
+        fused = decoded * float(weight) if fused is None else fused + decoded * float(weight)
+    assert fused is not None
+    binary = fused >= mask_threshold
+    if not binary.any():
+        best = max(candidates, key=lambda c: float(c["score"]))
+        return candidate_to_record(best)
+    rle = mask_to_rle(binary)
+    x, y, w, h = mask_util.toBbox(cast(Any, rle)).tolist()
+    return {
+        "image_id": int(candidates[0]["image_id"]),
+        "category_id": int(candidates[0]["category_id"]),
+        "segmentation": rle,
+        "score": float(scores.max()),
+        "bbox": [float(x), float(y), float(w), float(h)],
     }
-    order = torch.argsort(concat["scores"], descending=True)
-    return {k: v[order] for k, v in concat.items()}
+
+
+def _flip_image(image: torch.Tensor, hflip: bool, vflip: bool) -> torch.Tensor:
+    dims: list[int] = []
+    if vflip:
+        dims.append(1)
+    if hflip:
+        dims.append(2)
+    return torch.flip(image, dims=dims) if dims else image
+
+
+def _unflip_output(
+    output: dict[str, torch.Tensor],
+    width: int,
+    height: int,
+    hflip: bool,
+    vflip: bool,
+) -> dict[str, torch.Tensor]:
+    if not hflip and not vflip:
+        return output
+    boxes = output["boxes"].clone()
+    if hflip:
+        x1 = width - boxes[:, 2]
+        x2 = width - boxes[:, 0]
+        boxes[:, 0] = x1
+        boxes[:, 2] = x2
+    if vflip:
+        y1 = height - boxes[:, 3]
+        y2 = height - boxes[:, 1]
+        boxes[:, 1] = y1
+        boxes[:, 3] = y2
+    mask_dims: list[int] = []
+    if vflip:
+        mask_dims.append(2)
+    if hflip:
+        mask_dims.append(3)
+    masks = torch.flip(output["masks"], dims=mask_dims) if mask_dims else output["masks"]
+    return {**output, "boxes": boxes, "masks": masks}
+
+
+def _tta_flip_modes(tta_hflip: bool, tta_vhflip: bool) -> tuple[tuple[bool, bool], ...]:
+    if tta_vhflip:
+        return ((False, False), (True, False), (False, True), (True, True))
+    if tta_hflip:
+        return ((False, False), (True, False))
+    return ((False, False),)
+
 
 
 def _resize_output_to_original(
