@@ -38,6 +38,7 @@ Thumbs.db
 # Opencode
 .sisyphus/
 .ruff_cache/
+*/AGENTS.md
 
 # Weights & Biases
 **/wandb/
