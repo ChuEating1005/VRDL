@@ -1,0 +1,26 @@
+data_root: data/train
+out_dir: outputs/v3
+epochs: 200
+batch_size: 4
+patch_size: 192
+lr: 2.0e-4
+weight_decay: 0.0
+warmup_epochs: 8
+val_fraction: 0.05
+num_workers: 8
+seed: 1
+log_every: 50
+val_every: 1
+amp: true
+grad_clip: 0.0
+wandb_project: vrdl-hw4
+wandb_run_name: v3-bigpatch-longer
+wandb_mode: online
+model_name: promptir_v2
+model_kwargs:
+  ffn: simplegate
+  prompt: adair
+loss: charbonnier
+fft_weight: 0.1
+charb_eps: 1.0e-3
+ema_decay: 0.999
